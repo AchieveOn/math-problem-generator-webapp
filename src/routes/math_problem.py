@@ -1,134 +1,422 @@
 import os
 import base64
 import io
+import json
+import re
+import traceback
 from flask import Blueprint, request, jsonify, send_file
 from openai import OpenAI
 from PIL import Image
 import requests
 from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, KeepTogether
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from xml.sax.saxutils import escape
 from reportlab.lib.units import inch
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from docx import Document
 from docx.shared import Inches
+import matplotlib
+matplotlib.use('Agg')
+from matplotlib.mathtext import math_to_image
+from matplotlib.font_manager import FontProperties
 
 math_bp = Blueprint('math', __name__)
 
+DEFAULT_FONT_NAME = 'HeiseiKakuGo-W5'
+try:
+    pdfmetrics.registerFont(UnicodeCIDFont(DEFAULT_FONT_NAME))
+except Exception:
+    DEFAULT_FONT_NAME = 'Helvetica'
 # OpenAI クライアントの初期化
 client = OpenAI()
 
-# プロンプトテンプレートを読み込み
 def load_prompt_template():
     template_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'prompt_template.txt')
     with open(template_path, 'r', encoding='utf-8') as f:
         return f.read()
 
+
+MATH_PATTERN = re.compile(
+    r'(?<!\\)(?:\$\$.*?(?<!\\)\$\$|\$(?!\s).*?(?<!\\)\$)',
+    re.DOTALL,
+)
+
+
+def split_text_with_math(value):
+    segments = []
+    if not value:
+        return segments
+    last = 0
+    for match in MATH_PATTERN.finditer(value):
+        start_idx, end_idx = match.span()
+        if start_idx > last:
+            segments.append(('text', value[last:start_idx], False))
+        expr = match.group()
+        if expr.startswith('$$'):
+            content = expr[2:-2]
+            display = True
+        else:
+            content = expr[1:-1]
+            display = False
+        segments.append(('math', content.strip(), display))
+        last = end_idx
+    if last < len(value):
+        segments.append(('text', value[last:], False))
+    return segments
+
+
+def render_math_to_image(latex_expression, display=False, dpi=300):
+    expression = latex_expression.strip()
+    if not expression:
+        return None
+    font_size_display = 18
+    font_size_inline = 18
+    font_size = font_size_display if display else font_size_inline
+    prop = FontProperties(size=font_size)
+    buffer = io.BytesIO()
+    math_to_image(f'${expression}$', buffer, dpi=dpi, format='png', prop=prop, color='black')
+    buffer.seek(0)
+    with Image.open(buffer) as img:
+        width_px, height_px = img.size
+    buffer.seek(0)
+    width_points = width_px * 72 / dpi
+    height_points = height_px * 72 / dpi
+    return buffer, width_points, height_points
+
+
+
+def parse_structured_sections(raw_text):
+    sections = {}
+    if not raw_text:
+        return sections
+    current_label = None
+    for raw_line in str(raw_text).splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = re.match(r'^([^\s:：]{1,40})\s*[:：]\s*(.*)$', line)
+        if match:
+            current_label = match.group(1).strip()
+            sections[current_label] = match.group(2).strip()
+        elif current_label:
+            sections[current_label] = (sections[current_label] + '\n' + line).strip()
+    return sections
+
+
+def parse_analysis_output(raw_text, problem_text):
+    parsed = {
+        'grade': None,
+        'unit': None,
+        'difficulty': None,
+        'justification': None,
+        'summary': None,
+        'next_action_prompt': None,
+    }
+    normalized = ''
+    if isinstance(raw_text, str):
+        normalized = raw_text.strip()
+    elif raw_text is None:
+        normalized = ''
+    else:
+        normalized = str(raw_text).strip()
+
+    payload = None
+    if normalized:
+        try:
+            payload = json.loads(normalized)
+        except json.JSONDecodeError:
+            payload = None
+    if isinstance(payload, dict):
+        for key in parsed.keys():
+            value = payload.get(key)
+            if value:
+                parsed[key] = str(value).strip()
+        parsed['raw_text'] = str(payload.get('raw_text', normalized)).strip()
+        problem_from_payload = payload.get('problem_text') or payload.get('original_problem')
+        if problem_from_payload:
+            parsed['problem_text'] = str(problem_from_payload).strip()
+            parsed['original_problem'] = parsed['problem_text']
+    else:
+        sections = parse_structured_sections(normalized)
+        label_map = {
+            '学年': 'grade',
+            '対象学年': 'grade',
+            '単元': 'unit',
+            'テーマ': 'unit',
+            '分野': 'unit',
+            '難易度': 'difficulty',
+            'レベル': 'difficulty',
+            '推定根拠': 'justification',
+            '根拠': 'justification',
+            '理由': 'justification',
+            '要約': 'summary',
+            '概要': 'summary',
+            'まとめ': 'summary',
+            '次のステップ': 'next_action_prompt',
+            '次に学ぶ内容': 'next_action_prompt',
+            '学習ステップ': 'next_action_prompt',
+            '指導ポイント': 'next_action_prompt',
+        }
+        for label, value in sections.items():
+            key = label_map.get(label)
+            if key:
+                parsed[key] = value
+        if not parsed['justification'] and sections.get('推定根拠'):
+            parsed['justification'] = sections['推定根拠']
+        parsed['raw_text'] = normalized
+    if 'problem_text' not in parsed or not parsed['problem_text']:
+        parsed['problem_text'] = problem_text.strip() if problem_text else None
+    if 'original_problem' not in parsed or not parsed['original_problem']:
+        parsed['original_problem'] = parsed.get('problem_text')
+    return parsed
+
+
+
+
+
+
+
+
+def parse_generated_problems(raw_text):
+    if not raw_text:
+        return []
+    text = str(raw_text).strip()
+    if not text:
+        return []
+
+    problem_pattern = re.compile(
+        r'(?:^|\n)\s*(?:【\s*)?問題\s*(\d+)\s*(?:】|[:：]|[.)．])',
+        re.IGNORECASE,
+    )
+    matches = list(problem_pattern.finditer(text))
+    if not matches:
+        return []
+
+    problems = []
+    answer_pattern = re.compile(
+        r'(?:【\s*解答\s*(\d+)\s*】|解答\s*(\d+)\s*(?:[:：]|[.)．]))',
+        re.IGNORECASE,
+    )
+    explanation_pattern = re.compile(
+        r'(?:【\s*解説\s*(\d+)\s*】|解説\s*(\d+)\s*(?:[:：]|[.)．]))',
+        re.IGNORECASE,
+    )
+
+    for idx, match in enumerate(matches):
+        number = int(match.group(1)) if match.group(1) else idx + 1
+        start_idx = match.end()
+        end_idx = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        block = text[start_idx:end_idx].strip()
+
+        answer_body = None
+        explanation_body = None
+        problem_body = block
+
+        answer_match = answer_pattern.search(block)
+        if answer_match:
+            problem_body = block[:answer_match.start()].strip()
+            remainder = block[answer_match.end():].strip()
+            explanation_match = explanation_pattern.search(remainder)
+            if explanation_match:
+                answer_body = remainder[:explanation_match.start()].strip() or None
+                explanation_body = remainder[explanation_match.end():].strip() or None
+            else:
+                answer_body = remainder or None
+        else:
+            explanation_match = explanation_pattern.search(block)
+            if explanation_match:
+                problem_body = block[:explanation_match.start()].strip()
+                explanation_body = block[explanation_match.end():].strip() or None
+
+        title = None
+        title_match = re.match(r'^(?:タイトル|題名)[:：]\s*(.*)$', problem_body)
+        if title_match:
+            title = title_match.group(1).strip()
+            problem_body = problem_body[title_match.end():].strip()
+
+        problems.append({
+            'number': number,
+            'title': title,
+            'problem': problem_body or None,
+            'answer': answer_body,
+            'explanation': explanation_body,
+        })
+
+    return problems
+
+def build_problems_text(items):
+    if not items:
+        return ''
+    lines = []
+    for idx, item in enumerate(items, start=1):
+        lines.append(f'【問題{idx}】')
+        title = item.get('title')
+        if title:
+            lines.append(str(title).strip())
+        problem_text = item.get('problem')
+        if problem_text:
+            lines.append(str(problem_text).strip())
+        answer_text = item.get('answer')
+        if answer_text:
+            lines.append(f'【解答{idx}】')
+            lines.append(str(answer_text).strip())
+        explanation_text = item.get('explanation')
+        if explanation_text:
+            lines.append(f'【解説{idx}】')
+            lines.append(str(explanation_text).strip())
+        lines.append('')
+    return '\n'.join(lines).strip()
+
+
+def normalize_problems_text(raw_text):
+    if not raw_text:
+        return ''
+    result = str(raw_text).strip()
+    result = result.replace('�B��v�X�e�b�v', '�B\n��v�X�e�b�v')
+    result = result.replace('�B\n�ŏI�� ��', '\n�ŏI�� ��')
+    lines = [line for line in result.splitlines() if line.strip() != '�B']
+    return '\n'.join(lines)
+
+
+
+@math_bp.route('/analyze', methods=['POST'])
 @math_bp.route('/analyze-problem', methods=['POST'])
 def analyze_problem():
     """例題を解析して単元と学年を推定"""
     try:
-        data = request.get_json()
-        problem_text = data.get('problem_text', '')
-        
+        data = request.get_json() or {}
+        problem_text = (data.get('problem_text') or '').strip()
+
         if not problem_text:
             return jsonify({'error': '問題文が入力されていません'}), 400
-        
-        # プロンプトテンプレートを読み込み
+
         try:
             prompt_template = load_prompt_template()
         except Exception as e:
             print(f"プロンプトテンプレート読み込みエラー: {e}")
             return jsonify({'error': 'プロンプトテンプレートの読み込みに失敗しました'}), 500
-        
-        # 例題解析用のプロンプト
+
         analysis_prompt = f"""
 {prompt_template}
 
-以下の例題を解析してください。解答は求めず、以下の情報のみを提供してください：
+以下の例題を解析してください。解答は求めず、次の項目だけを順番を変えずに日本語で出力してください。
 
 例題：
 {problem_text}
 
-出力形式：
+出力形式（見出し名を変更しないこと）：
 学年: [中1/中2/中3/数I/数A/数II/数B/数III/数C]
 単元: [具体的な単元名]
+難易度: [Level 1 (基礎) 〜 Level 5 (難関) などの表記]
 推定根拠: [簡潔な説明]
+要約: [解法の要点を1〜2文で]
+次のステップ: [学習者への次の学習提案]
 """
-        
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4.1-mini",
-                messages=[
-                    {"role": "system", "content": "あなたは数学教育の専門家です。"},
-                    {"role": "user", "content": analysis_prompt}
-                ],
-                max_tokens=500,
-                temperature=0.3
-            )
-            
-            analysis_result = response.choices[0].message.content
-            
-            return jsonify({
-                'success': True,
-                'analysis': analysis_result,
-                'original_problem': problem_text
-            })
-        except Exception as e:
-            print(f"OpenAI API エラー: {e}")
-            return jsonify({'error': f'AI解析中にエラーが発生しました: {str(e)}'}), 500
-        
+
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": "あなたは数学教育の専門家です。"},
+                {"role": "user", "content": analysis_prompt}
+            ],
+            max_tokens=500,
+            temperature=0.3
+        )
+
+        analysis_raw = (response.choices[0].message.content or '').strip()
+        analysis_data = parse_analysis_output(analysis_raw, problem_text)
+        analysis_data.setdefault('problem_text', problem_text)
+        analysis_data.setdefault('original_problem', problem_text)
+
+        return jsonify({
+            'success': True,
+            'analysis': analysis_data,
+            'original_problem': problem_text,
+            'raw_response': analysis_raw,
+        })
+
     except Exception as e:
-        print(f"一般的なエラー: {e}")
+        print(f"例題解析エラー: {e}")
+        traceback.print_exc()
         return jsonify({'error': f'解析中にエラーが発生しました: {str(e)}'}), 500
 
+
+@math_bp.route('/generate', methods=['POST'])
 @math_bp.route('/generate-problems', methods=['POST'])
 def generate_problems():
     """類題を生成"""
     try:
-        data = request.get_json()
-        original_problem = data.get('original_problem', '')
-        difficulty = data.get('difficulty', 'L3')  # L1-L5
-        count = data.get('count', 3)
-        solution_method = data.get('solution_method', '')
-        
+        data = request.get_json() or {}
+        analysis_data = data.get('analysis') or {}
+        original_problem = (data.get('original_problem') or analysis_data.get('problem_text') or '').strip()
+
         if not original_problem:
             return jsonify({'error': '元の問題が指定されていません'}), 400
-        
-        # プロンプトテンプレートを読み込み
-        prompt_template = load_prompt_template()
-        
-        # 類題生成用のプロンプト
+
+        difficulty = data.get('difficulty') or analysis_data.get('difficulty') or 'Level 3'
+        count_raw = data.get('count') or analysis_data.get('count') or 3
+        try:
+            count = max(1, int(count_raw))
+        except (TypeError, ValueError):
+            count = 3
+
+        solution_method = data.get('solution_method') or data.get('solution_hint') or ''
+        analysis_summary = data.get('analysis_summary') or analysis_data.get('summary') or ''
+
+        try:
+            prompt_template = load_prompt_template()
+        except Exception as e:
+            print(f"プロンプトテンプレート読み込みエラー: {e}")
+            return jsonify({'error': 'プロンプトテンプレートの読み込みに失敗しました'}), 500
+
+        context_lines = []
+        if analysis_data.get('grade'):
+            context_lines.append(f"学年: {analysis_data['grade']}")
+        if analysis_data.get('unit'):
+            context_lines.append(f"単元: {analysis_data['unit']}")
+        if analysis_data.get('difficulty'):
+            context_lines.append(f"解析難易度: {analysis_data['difficulty']}")
+        if analysis_summary:
+            context_lines.append(f"要約: {analysis_summary}")
+        if analysis_data.get('justification'):
+            context_lines.append(f"推定根拠: {analysis_data['justification']}")
+        if solution_method:
+            context_lines.append(f"解法指定: {solution_method}")
+
+        context_text = '\n'.join(context_lines) or '追加情報なし'
+
         generation_prompt = f"""
 {prompt_template}
 
-以下の例題を参考に、{count}問の類題を生成してください。
+以下の例題と解析情報をもとに、新しい数学の類題を{count}問作成してください。
+
+解析情報:
+{context_text}
 
 例題：
 {original_problem}
 
-設定：
-- 難易度: {difficulty}
-- 作問数: {count}問
-"""
-        
-        if solution_method:
-            generation_prompt += f"- 解法指定: {solution_method}\n"
-        
-        generation_prompt += """
-各問題について、以下の形式で出力してください：
-
+出力形式（必ずこの形式を守ること）：
 【問題1】
-[問題文]
-
+問題文
 【解答1】
-[解答]
-
+解答
 【解説1】
-[簡潔な解説]
-
-（以下、問題数分繰り返し）
+解説
+（指定した問題数になるまで番号を増やして繰り返す）
 """
-        
+        generation_prompt += """
+追加ルール:
+- 指定された作問数 {count} 問を必ず生成してください。
+- ユーザーへの質問や確認は行わず、指定の形式のみで回答してください。
+- 各問題には必ず問題文・解答・解説を含めてください。
+"""
+
+        if analysis_summary:
+            generation_prompt += '\n各問題の解説には学習の要点を1文以上含めてください。'
+
         response = client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[
@@ -138,21 +426,38 @@ def generate_problems():
             max_tokens=2000,
             temperature=0.7
         )
-        
-        generated_problems = response.choices[0].message.content
-        
+
+        raw_output = (response.choices[0].message.content or '').strip()
+        problems = parse_generated_problems(raw_output)
+        problems_text = build_problems_text(problems) if problems else raw_output
+
+        metadata = {
+            'grade': analysis_data.get('grade'),
+            'unit': analysis_data.get('unit'),
+            'difficulty': difficulty,
+        }
+
+        notes_sections = []
+        if analysis_data.get('justification'):
+            notes_sections.append(str(analysis_data['justification']).strip())
+        if solution_method:
+            notes_sections.append(f"解法指定: {solution_method}")
+        if analysis_summary:
+            notes_sections.append(f"解析要約: {analysis_summary}")
+        if notes_sections:
+            metadata['notes'] = '\n'.join(notes_sections)
+
         return jsonify({
             'success': True,
-            'problems': generated_problems,
-            'settings': {
-                'difficulty': difficulty,
-                'count': count,
-                'solution_method': solution_method
-            }
+            'problems': problems,
+            'problems_text': problems_text,
+            'metadata': metadata,
+            'raw_response': raw_output,
         })
-        
+
     except Exception as e:
-        return jsonify({'error': f'問題生成中にエラーが発生しました: {str(e)}'}), 500
+        traceback.print_exc()
+        return jsonify({'error': f'類題生成中にエラーが発生しました: {str(e)}'}), 500
 
 @math_bp.route('/ocr-image', methods=['POST'])
 def ocr_image():
@@ -200,104 +505,197 @@ def ocr_image():
     except Exception as e:
         return jsonify({'error': f'OCR処理中にエラーが発生しました: {str(e)}'}), 500
 
+
+@math_bp.route('/download/pdf', methods=['POST'])
 @math_bp.route('/export-pdf', methods=['POST'])
 def export_pdf():
     """生成された問題をPDF形式でエクスポート"""
     try:
-        data = request.get_json()
-        problems_text = data.get('problems_text', '')
-        
+        data = request.get_json() or {}
+        problems = data.get('problems') or []
+        problems_text = data.get('problems_text') or ''
+        metadata = data.get('metadata') or {}
+
+        if problems and not problems_text:
+            problems_text = build_problems_text(problems)
+
+        problems_text = normalize_problems_text(problems_text)
+
         if not problems_text:
             return jsonify({'error': '出力する問題がありません'}), 400
-        
-        # PDFファイルを作成
+
         buffer = io.BytesIO()
         doc = SimpleDocTemplate(buffer, pagesize=A4)
         styles = getSampleStyleSheet()
-        
-        # カスタムスタイルを作成
+
         title_style = ParagraphStyle(
             'CustomTitle',
             parent=styles['Heading1'],
+            fontName=DEFAULT_FONT_NAME,
             fontSize=16,
-            spaceAfter=30,
+            spaceAfter=24,
         )
-        
+
         content_style = ParagraphStyle(
             'CustomContent',
             parent=styles['Normal'],
+            fontName=DEFAULT_FONT_NAME,
             fontSize=12,
-            spaceAfter=12,
+            spaceAfter=6,
         )
-        
-        # コンテンツを構築
+
         story = []
-        story.append(Paragraph("数学問題集", title_style))
+        story.append(Paragraph('数学問題集', title_style))
         story.append(Spacer(1, 12))
-        
-        # 問題テキストを段落に分割
-        lines = problems_text.split('\n')
-        for line in lines:
-            if line.strip():
-                story.append(Paragraph(line, content_style))
-            else:
+
+        metadata_lines = []
+        grade = metadata.get('grade')
+        if grade:
+            metadata_lines.append(f'学年: {grade}')
+        unit = metadata.get('unit')
+        if unit:
+            metadata_lines.append(f'単元: {unit}')
+        difficulty_value = metadata.get('difficulty')
+        if difficulty_value:
+            metadata_lines.append(f'難易度: {difficulty_value}')
+        if metadata_lines:
+            story.append(Paragraph('<br/>'.join(escape(line) for line in metadata_lines), content_style))
+            story.append(Spacer(1, 12))
+
+        notes = metadata.get('notes')
+        if notes:
+            for note_line in str(notes).splitlines():
+                if note_line.strip():
+                    story.append(Paragraph(escape(note_line.strip()), content_style))
+            story.append(Spacer(1, 12))
+
+        for line in problems_text.split('\n'):
+            segments = split_text_with_math(line)
+            if not segments:
                 story.append(Spacer(1, 6))
-        
-        # PDFを構築
+                continue
+
+            flow_items = []
+            for kind, value, display in segments:
+                if kind == 'text':
+                    clean_text = value.strip()
+                    if clean_text:
+                        flow_items.append(Paragraph(escape(clean_text), content_style))
+                elif kind == 'math':
+                    rendered = render_math_to_image(value, display=display)
+                    if rendered:
+                        img_buffer, width_pt, height_pt = rendered
+                        flow_items.append(Image(img_buffer, width=width_pt, height=height_pt))
+            if flow_items:
+                story.append(KeepTogether(flow_items))
+                story.append(Spacer(1, 6))
+
         doc.build(story)
         buffer.seek(0)
-        
+
         return send_file(
             buffer,
             as_attachment=True,
             download_name='math_problems.pdf',
             mimetype='application/pdf'
         )
-        
+
     except Exception as e:
+        traceback.print_exc()
         return jsonify({'error': f'PDF出力中にエラーが発生しました: {str(e)}'}), 500
 
+
+@math_bp.route('/download/word', methods=['POST'])
 @math_bp.route('/export-word', methods=['POST'])
 def export_word():
     """生成された問題をWord形式でエクスポート"""
     try:
-        data = request.get_json()
-        problems_text = data.get('problems_text', '')
-        
-        if not problems_text:
+        data = request.get_json() or {}
+        problems = data.get('problems') or []
+        problems_text = data.get('problems_text') or ''
+        metadata = data.get('metadata') or {}
+
+        if problems and not problems_text:
+            problems_text = build_problems_text(problems)
+
+        if not problems and problems_text:
+            problems = parse_generated_problems(problems_text)
+
+        if not problems and not problems_text:
             return jsonify({'error': '出力する問題がありません'}), 400
-        
-        # Wordドキュメントを作成
+
         doc = Document()
-        
-        # タイトルを追加
-        title = doc.add_heading('数学問題集', 0)
-        
-        # 問題テキストを追加
-        lines = problems_text.split('\n')
-        for line in lines:
-            if line.strip():
-                if line.startswith('【問題'):
-                    doc.add_heading(line, level=1)
-                elif line.startswith('【解答') or line.startswith('【解説'):
-                    doc.add_heading(line, level=2)
-                else:
-                    doc.add_paragraph(line)
-            else:
-                doc.add_paragraph('')
-        
-        # バッファに保存
+        doc.add_heading('数学問題集', 0)
+
+        metadata_lines = []
+        grade = metadata.get('grade')
+        if grade:
+            metadata_lines.append(f'学年: {grade}')
+        unit = metadata.get('unit')
+        if unit:
+            metadata_lines.append(f'単元: {unit}')
+        difficulty_value = metadata.get('difficulty')
+        if difficulty_value:
+            metadata_lines.append(f'難易度: {difficulty_value}')
+        for line in metadata_lines:
+            doc.add_paragraph(line)
+
+        notes = metadata.get('notes')
+        if notes:
+            for note_line in str(notes).splitlines():
+                doc.add_paragraph(note_line)
+
+        if problems:
+            for idx, item in enumerate(problems, start=1):
+                heading = f'問題{idx}'
+                title = item.get('title')
+                if title:
+                    heading += f'：{title}'
+                doc.add_heading(heading, level=1)
+
+                problem_body = item.get('problem')
+                if problem_body:
+                    for segment in str(problem_body).splitlines() or ['']:
+                        doc.add_paragraph(segment)
+
+                answer_body = item.get('answer')
+                if answer_body:
+                    doc.add_heading('【解答】', level=2)
+                    for segment in str(answer_body).splitlines() or ['']:
+                        doc.add_paragraph(segment)
+
+                explanation_body = item.get('explanation')
+                if explanation_body:
+                    doc.add_heading('【解説】', level=2)
+                    for segment in str(explanation_body).splitlines() or ['']:
+                        doc.add_paragraph(segment)
+        else:
+            for line in (problems_text or '').split('\n'):
+                doc.add_paragraph(line)
+
         buffer = io.BytesIO()
         doc.save(buffer)
         buffer.seek(0)
-        
+
         return send_file(
             buffer,
             as_attachment=True,
             download_name='math_problems.docx',
             mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
         )
-        
+
     except Exception as e:
+        traceback.print_exc()
         return jsonify({'error': f'Word出力中にエラーが発生しました: {str(e)}'}), 500
+
+
+
+
+
+
+
+
+
+
+
 

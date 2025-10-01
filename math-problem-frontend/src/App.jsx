@@ -7,6 +7,7 @@ import { Textarea } from '@/components/ui/textarea.jsx'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select.jsx'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs.jsx'
 import { FileText, Download, Upload, Calculator } from 'lucide-react'
+import MathText from '@/components/MathText.jsx'
 import './App.css'
 
 function App() {
@@ -43,7 +44,15 @@ function App() {
       }
 
       const result = await response.json()
-      setAnalysisResult(result)
+      if (!result.success) {
+        throw new Error(result.error || '解析結果を取得できませんでした')
+      }
+      const normalizedAnalysis = {
+        ...(result.analysis || {}),
+        original_problem: result.analysis?.original_problem || result.original_problem || textInput.trim(),
+        raw_response: result.raw_response,
+      }
+      setAnalysisResult(normalizedAnalysis)
     } catch (error) {
       console.error('Error:', error)
       alert('解析中にエラーが発生しました: ' + error.message)
@@ -60,6 +69,7 @@ function App() {
 
     setIsGenerating(true)
     try {
+      const originalProblem = analysisResult?.problem_text || analysisResult?.original_problem || textInput.trim()
       const response = await fetch(`${API_BASE_URL}/generate`, {
         method: 'POST',
         headers: {
@@ -67,9 +77,11 @@ function App() {
         },
         body: JSON.stringify({
           analysis: analysisResult,
-          difficulty: difficulty,
-          count: problemCount,
+          original_problem: originalProblem,
+          difficulty,
+          count: Number(problemCount) || 1,
           solution_hint: solutionHint,
+          analysis_summary: analysisResult?.summary || '',
         }),
       })
 
@@ -96,7 +108,11 @@ function App() {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ problems: generatedProblems }),
+        body: JSON.stringify({
+          problems: generatedProblems?.problems ?? [],
+          problems_text: generatedProblems?.problems_text ?? '',
+          metadata: generatedProblems?.metadata ?? {},
+        }),
       })
 
       if (!response.ok) {
@@ -127,7 +143,11 @@ function App() {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ problems: generatedProblems }),
+        body: JSON.stringify({
+          problems: generatedProblems?.problems ?? [],
+          problems_text: generatedProblems?.problems_text ?? '',
+          metadata: generatedProblems?.metadata ?? {},
+        }),
       })
 
       if (!response.ok) {
@@ -234,6 +254,17 @@ function App() {
                     <p className="font-medium">{analysisResult.difficulty || '不明'}</p>
                   </div>
                 </div>
+                {analysisResult.summary && (
+                  <div className="mt-4 space-y-2">
+                    <Label>解析メモ</Label>
+                    <MathText className="text-sm text-gray-700">
+                      {analysisResult.summary}
+                    </MathText>
+                  </div>
+                )}
+                {analysisResult.next_action_prompt && (
+                  <p className="text-sm text-gray-600 mt-4">{analysisResult.next_action_prompt}</p>
+                )}
               </CardContent>
             </Card>
           )}
@@ -298,10 +329,52 @@ function App() {
                 <CardTitle>生成された類題</CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
-                <div className="bg-gray-50 p-4 rounded-lg">
-                  <pre className="whitespace-pre-wrap text-sm">
-                    {JSON.stringify(generatedProblems, null, 2)}
-                  </pre>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  <div>
+                    <Label>学年</Label>
+                    <p className="font-medium">{generatedProblems?.metadata?.grade || analysisResult?.grade || '不明'}</p>
+                  </div>
+                  <div>
+                    <Label>単元</Label>
+                    <p className="font-medium">{generatedProblems?.metadata?.unit || analysisResult?.unit || '不明'}</p>
+                  </div>
+                  <div>
+                    <Label>生成難易度</Label>
+                    <p className="font-medium">{generatedProblems?.metadata?.difficulty || difficulty}</p>
+                  </div>
+                </div>
+                {generatedProblems?.metadata?.notes && (
+                  <MathText className="text-sm text-gray-600">
+                    {generatedProblems.metadata.notes}
+                  </MathText>
+                )}
+                <div className="space-y-6">
+                  {Array.isArray(generatedProblems?.problems) && generatedProblems.problems.length > 0 ? (
+                    generatedProblems.problems.map((item, idx) => (
+                      <div key={idx} className="bg-gray-50 p-4 rounded-lg space-y-2">
+                        <p className="font-semibold">問題{idx + 1}{item.title ? `：${item.title}` : ''}</p>
+                        {item.problem && (
+                          <MathText className="text-sm text-gray-800">{item.problem}</MathText>
+                        )}
+                        {item.answer && (
+                          <div className="space-y-1">
+                            <p className="font-medium text-sm text-gray-700">解答</p>
+                            <MathText className="text-sm text-gray-800">{item.answer}</MathText>
+                          </div>
+                        )}
+                        {item.explanation && (
+                          <div className="space-y-1">
+                            <p className="font-medium text-sm text-gray-700">解説</p>
+                            <MathText className="text-sm text-gray-800">{item.explanation}</MathText>
+                          </div>
+                        )}
+                      </div>
+                    ))
+                  ) : (
+                    <div className="bg-gray-50 p-4 rounded-lg">
+                      <pre className="whitespace-pre-wrap text-sm">{generatedProblems?.problems_text || '出力がありません'}</pre>
+                    </div>
+                  )}
                 </div>
                 <div className="flex gap-2">
                   <Button onClick={handleDownloadPDF} className="flex-1">
