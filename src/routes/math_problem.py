@@ -5,11 +5,11 @@ import json
 import re
 import traceback
 from flask import Blueprint, request, jsonify, send_file
-from openai import OpenAI
-from PIL import Image
+from openai import OpenAI, APIConnectionError
+from PIL import Image as PILImage
 import requests
 from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, KeepTogether
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, KeepTogether
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from xml.sax.saxutils import escape
 from reportlab.lib.units import inch
@@ -18,7 +18,11 @@ from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from docx import Document
 from docx.shared import Inches
 import matplotlib
+from matplotlib import rcParams
 matplotlib.use('Agg')
+rcParams['mathtext.fontset'] = 'stix'
+rcParams['font.family'] = 'STIXGeneral'
+rcParams['mathtext.default'] = 'regular'
 from matplotlib.mathtext import math_to_image
 from matplotlib.font_manager import FontProperties
 
@@ -39,9 +43,11 @@ def load_prompt_template():
 
 
 MATH_PATTERN = re.compile(
-    r'(?<!\\)(?:\$\$.*?(?<!\\)\$\$|\$(?!\s).*?(?<!\\)\$)',
+    r'(?<!\\)(?:\$\$.*?(?<!\\)\$\$|\$(?!\s).*?(?<!\\)\$|\\\(.*?(?<!\\)\\\)|\\\[.*?(?<!\\)\\\])',
     re.DOTALL,
 )
+
+
 
 
 def split_text_with_math(value):
@@ -54,37 +60,65 @@ def split_text_with_math(value):
         if start_idx > last:
             segments.append(('text', value[last:start_idx], False))
         expr = match.group()
-        if expr.startswith('$$'):
+        display = False
+        content = expr
+        if expr.startswith('$$') and expr.endswith('$$'):
             content = expr[2:-2]
             display = True
-        else:
+        elif expr.startswith('$') and expr.endswith('$'):
             content = expr[1:-1]
             display = False
-        segments.append(('math', content.strip(), display))
+        elif expr.startswith(r'\[') and expr.endswith(r'\]'):
+            content = expr[2:-2]
+            display = True
+        elif expr.startswith(r'\(') and expr.endswith(r'\)'):
+            content = expr[2:-2]
+            display = False
+        content = content.strip()
+        if content:
+            segments.append(('math', content, display))
         last = end_idx
     if last < len(value):
         segments.append(('text', value[last:], False))
     return segments
 
 
+
 def render_math_to_image(latex_expression, display=False, dpi=300):
     expression = latex_expression.strip()
     if not expression:
         return None
-    font_size_display = 18
+    font_size_display = 20
     font_size_inline = 18
     font_size = font_size_display if display else font_size_inline
-    prop = FontProperties(size=font_size)
+    prop = FontProperties(size=font_size, family='STIXGeneral')
+
+    math_body = expression
+
+    math_string = f'${math_body}$'
     buffer = io.BytesIO()
-    math_to_image(f'${expression}$', buffer, dpi=dpi, format='png', prop=prop, color='black')
+    math_to_image(math_string, buffer, dpi=dpi, format='png', prop=prop, color='black')
     buffer.seek(0)
-    with Image.open(buffer) as img:
+    with PILImage.open(buffer) as img:
         width_px, height_px = img.size
     buffer.seek(0)
     width_points = width_px * 72 / dpi
     height_points = height_px * 72 / dpi
     return buffer, width_points, height_points
 
+
+
+
+
+
+
+
+
+
+def normalize_latex_spacing(text):
+    if not text:
+        return text
+    return re.sub(r'\\\s+', r'\\', text)
 
 
 def parse_structured_sections(raw_text):
@@ -236,6 +270,10 @@ def parse_generated_problems(raw_text):
             title = title_match.group(1).strip()
             problem_body = problem_body[title_match.end():].strip()
 
+        problem_body = normalize_latex_spacing(problem_body) if problem_body else None
+        answer_body = normalize_latex_spacing(answer_body) if answer_body else None
+        explanation_body = normalize_latex_spacing(explanation_body) if explanation_body else None
+
         problems.append({
             'number': number,
             'title': title,
@@ -281,6 +319,7 @@ def normalize_problems_text(raw_text):
 
 
 
+
 @math_bp.route('/analyze', methods=['POST'])
 @math_bp.route('/analyze-problem', methods=['POST'])
 def analyze_problem():
@@ -315,15 +354,18 @@ def analyze_problem():
 次のステップ: [学習者への次の学習提案]
 """
 
-        response = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {"role": "system", "content": "あなたは数学教育の専門家です。"},
-                {"role": "user", "content": analysis_prompt}
-            ],
-            max_tokens=500,
-            temperature=0.3
-        )
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=[
+                    {"role": "system", "content": "あなたは数学教育の専門家です。"},
+                    {"role": "user", "content": analysis_prompt}
+                ],
+                max_tokens=500,
+                temperature=0.3
+            )
+        except APIConnectionError:
+            return jsonify({'error': 'OpenAI APIへの接続に失敗しました。ネットワーク環境とAPIキーを確認してください。'}), 503
 
         analysis_raw = (response.choices[0].message.content or '').strip()
         analysis_data = parse_analysis_output(analysis_raw, problem_text)
@@ -341,6 +383,7 @@ def analyze_problem():
         print(f"例題解析エラー: {e}")
         traceback.print_exc()
         return jsonify({'error': f'解析中にエラーが発生しました: {str(e)}'}), 500
+
 
 
 @math_bp.route('/generate', methods=['POST'])
@@ -407,6 +450,7 @@ def generate_problems():
 解説
 （指定した問題数になるまで番号を増やして繰り返す）
 """
+
         generation_prompt += """
 追加ルール:
 - 指定された作問数 {count} 問を必ず生成してください。
@@ -417,15 +461,18 @@ def generate_problems():
         if analysis_summary:
             generation_prompt += '\n各問題の解説には学習の要点を1文以上含めてください。'
 
-        response = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {"role": "system", "content": "あなたは数学問題作成の専門家です。"},
-                {"role": "user", "content": generation_prompt}
-            ],
-            max_tokens=2000,
-            temperature=0.7
-        )
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=[
+                    {"role": "system", "content": "あなたは数学問題作成の専門家です。"},
+                    {"role": "user", "content": generation_prompt}
+                ],
+                max_tokens=2000,
+                temperature=0.7
+            )
+        except APIConnectionError:
+            return jsonify({'error': 'OpenAI APIへの接続に失敗しました。ネットワーク環境とAPIキーを確認してください。'}), 503
 
         raw_output = (response.choices[0].message.content or '').strip()
         problems = parse_generated_problems(raw_output)
@@ -459,49 +506,52 @@ def generate_problems():
         traceback.print_exc()
         return jsonify({'error': f'類題生成中にエラーが発生しました: {str(e)}'}), 500
 
+
+
 @math_bp.route('/ocr-image', methods=['POST'])
 def ocr_image():
     """画像からテキストを抽出（OCR）"""
     try:
         if 'image' not in request.files:
             return jsonify({'error': '画像ファイルが選択されていません'}), 400
-        
+
         image_file = request.files['image']
-        
-        # 画像をbase64エンコード
+
         image_data = image_file.read()
         base64_image = base64.b64encode(image_data).decode('utf-8')
-        
-        # OpenAI Vision APIを使用してOCR
-        response = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "この画像に含まれる数学問題のテキストを正確に読み取って、テキスト形式で出力してください。数式は適切な記法で表現してください。"
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
+
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "この画像に含まれる数学問題のテキストを正確に読み取って、テキスト形式で出力してください。数式は適切な記法で表現してください。"
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{base64_image}"
+                                }
                             }
-                        }
-                    ]
-                }
-            ],
-            max_tokens=1000
-        )
-        
+                        ]
+                    }
+                ],
+                max_tokens=1000
+            )
+        except APIConnectionError:
+            return jsonify({'error': 'OpenAI APIへの接続に失敗しました。ネットワーク環境とAPIキーを確認してください。'}), 503
+
         extracted_text = response.choices[0].message.content
-        
+
         return jsonify({
             'success': True,
             'extracted_text': extracted_text
         })
-        
+
     except Exception as e:
         return jsonify({'error': f'OCR処理中にエラーが発生しました: {str(e)}'}), 500
 
@@ -514,12 +564,14 @@ def export_pdf():
         data = request.get_json() or {}
         problems = data.get('problems') or []
         problems_text = data.get('problems_text') or ''
+        problems_text = normalize_latex_spacing(problems_text)
         metadata = data.get('metadata') or {}
 
         if problems and not problems_text:
             problems_text = build_problems_text(problems)
 
         problems_text = normalize_problems_text(problems_text)
+        problems_text = normalize_latex_spacing(problems_text)
 
         if not problems_text:
             return jsonify({'error': '出力する問題がありません'}), 400
@@ -570,6 +622,7 @@ def export_pdf():
             story.append(Spacer(1, 12))
 
         for line in problems_text.split('\n'):
+            line = normalize_latex_spacing(line)
             segments = split_text_with_math(line)
             if not segments:
                 story.append(Spacer(1, 6))
@@ -585,7 +638,7 @@ def export_pdf():
                     rendered = render_math_to_image(value, display=display)
                     if rendered:
                         img_buffer, width_pt, height_pt = rendered
-                        flow_items.append(Image(img_buffer, width=width_pt, height=height_pt))
+                        flow_items.append(RLImage(img_buffer, width=width_pt, height=height_pt))
             if flow_items:
                 story.append(KeepTogether(flow_items))
                 story.append(Spacer(1, 6))
@@ -600,7 +653,7 @@ def export_pdf():
             mimetype='application/pdf'
         )
 
-    except Exception as e:
+    except APIConnectionError:
         traceback.print_exc()
         return jsonify({'error': f'PDF出力中にエラーが発生しました: {str(e)}'}), 500
 
@@ -671,7 +724,7 @@ def export_word():
                         doc.add_paragraph(segment)
         else:
             for line in (problems_text or '').split('\n'):
-                doc.add_paragraph(line)
+                doc.add_paragraph(normalize_latex_spacing(line))
 
         buffer = io.BytesIO()
         doc.save(buffer)
@@ -684,9 +737,13 @@ def export_word():
             mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
         )
 
-    except Exception as e:
+    except APIConnectionError:
         traceback.print_exc()
         return jsonify({'error': f'Word出力中にエラーが発生しました: {str(e)}'}), 500
+
+
+
+
 
 
 
