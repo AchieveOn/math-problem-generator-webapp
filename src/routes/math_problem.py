@@ -14,6 +14,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from xml.sax.saxutils import escape
 from reportlab.lib.units import inch
 from reportlab.pdfbase import pdfmetrics
+from reportlab.graphics import renderPDF
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from docx import Document
 from docx.shared import Inches, Pt
@@ -93,6 +94,14 @@ def split_text_with_math(value):
 
 def generate_math_assets(latex_expression, display=False, dpi=300):
     expression = latex_expression.strip()
+    if expression.startswith('$$') and expression.endswith('$$') and len(expression) > 4:
+        expression = expression[2:-2].strip()
+    elif expression.startswith('$') and expression.endswith('$') and len(expression) > 2:
+        expression = expression[1:-1].strip()
+    if expression.startswith('\\(') and expression.endswith('\\)') and len(expression) > 4:
+        expression = expression[2:-2].strip()
+    if expression.startswith('\\[') and expression.endswith('\\]') and len(expression) > 4:
+        expression = expression[2:-2].strip()
     if not expression:
         return None
     font_size = 16
@@ -191,15 +200,21 @@ def append_text_with_math_to_story(story, text, style):
                 if clean_text:
                     flow_items.append(Paragraph(escape(clean_text), style))
             elif kind == 'math':
-                rendered = render_math_to_image(value, display=display)
-                if rendered:
-                    img_buffer, width_pt, height_pt = rendered
-                    flow_items.append(RLImage(img_buffer, width=width_pt, height=height_pt))
+                assets = generate_math_assets(value, display=display)
+                if assets:
+                    png_buffer, width_pt, height_pt, drawing = assets
+                    if drawing is not None:
+                        print('[debug] using vector drawing for PDF')
+                        flow_items.append(renderPDF.GraphicsFlowable(drawing))
+                    else:
+                        print('[debug] falling back to PNG for PDF')
+                        png_buffer.seek(0)
+                        flow_items.append(RLImage(png_buffer, width=width_pt, height=height_pt))
+                else:
+                    print('[debug] no assets generated for expression')
         if flow_items:
             story.append(KeepTogether(flow_items))
             story.append(Spacer(1, 6))
-
-
 
 
 def add_paragraph_with_math(document, text, style_name=None):
@@ -862,6 +877,13 @@ def export_word():
     except Exception as e:
         traceback.print_exc()
         return jsonify({'error': f'Word出力中にエラーが発生しました: {str(e)}'}), 500
+
+
+
+
+
+
+
 
 
 
