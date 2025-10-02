@@ -16,7 +16,7 @@ from reportlab.lib.units import inch
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from docx import Document
-from docx.shared import Inches
+from docx.shared import Inches, Pt
 import matplotlib
 from matplotlib import rcParams
 matplotlib.use('Agg')
@@ -25,6 +25,11 @@ rcParams['font.family'] = 'STIXGeneral'
 rcParams['mathtext.default'] = 'regular'
 from matplotlib.mathtext import math_to_image
 from matplotlib.font_manager import FontProperties
+
+try:
+    from svglib.svglib import svg2rlg
+except ImportError:
+    svg2rlg = None
 
 math_bp = Blueprint('math', __name__)
 
@@ -84,27 +89,57 @@ def split_text_with_math(value):
 
 
 
-def render_math_to_image(latex_expression, display=False, dpi=300):
+
+
+def generate_math_assets(latex_expression, display=False, dpi=300):
     expression = latex_expression.strip()
     if not expression:
         return None
-    font_size_display = 20
-    font_size_inline = 18
-    font_size = font_size_display if display else font_size_inline
+    font_size = 16
     prop = FontProperties(size=font_size, family='STIXGeneral')
+    math_string = f'$' + expression + '$'
 
-    math_body = expression
-
-    math_string = f'${math_body}$'
-    buffer = io.BytesIO()
-    math_to_image(math_string, buffer, dpi=dpi, format='png', prop=prop, color='black')
-    buffer.seek(0)
-    with PILImage.open(buffer) as img:
+    png_buffer = io.BytesIO()
+    math_to_image(math_string, png_buffer, dpi=dpi, format='png', prop=prop, color='black')
+    png_buffer.seek(0)
+    with PILImage.open(png_buffer) as img:
         width_px, height_px = img.size
-    buffer.seek(0)
+    png_buffer.seek(0)
     width_points = width_px * 72 / dpi
     height_points = height_px * 72 / dpi
-    return buffer, width_points, height_points
+
+    drawing = None
+    if svg2rlg is not None:
+        svg_buffer = io.BytesIO()
+        try:
+            math_to_image(math_string, svg_buffer, dpi=dpi, format='svg', prop=prop, color='black')
+            svg_buffer.seek(0)
+            drawing = svg2rlg(svg_buffer)
+            if getattr(drawing, 'width', 0) and getattr(drawing, 'height', 0):
+                scale_x = width_points / drawing.width
+                scale_y = height_points / drawing.height
+                scale = min(scale_x, scale_y)
+                drawing.scale(scale, scale)
+                drawing.width *= scale
+                drawing.height *= scale
+                drawing.hAlign = 'LEFT'
+            else:
+                drawing = None
+        except Exception:
+            drawing = None
+        finally:
+            svg_buffer.close()
+    return png_buffer, width_points, height_points, drawing
+
+def render_math_to_image(latex_expression, display=False, dpi=300):
+    assets = generate_math_assets(latex_expression, display=display, dpi=dpi)
+    if not assets:
+        return None
+    png_buffer, width_points, height_points, _ = assets
+    png_buffer.seek(0)
+    return png_buffer, width_points, height_points
+
+
 
 
 
@@ -118,12 +153,25 @@ def render_math_to_image(latex_expression, display=False, dpi=300):
 def normalize_latex_spacing(text):
     if not text:
         return text
-    return re.sub(r'\\\s+', r'\\', text)
+    text = str(text)
 
+    def _collapse_display(match):
+        inner = match.group(1).strip()
+        inner = ' '.join(inner.split())
+        return r'\[' + inner + r'\]'
 
+    text = re.sub(r'\\\[\s*(.*?)\s*\\\]', _collapse_display, text, flags=re.S)
 
+    def _collapse_inline(match):
+        inner = match.group(1).strip()
+        inner = ' '.join(inner.split())
+        return r'\(' + inner + r'\)'
 
+    text = re.sub(r'\\\(\s*(.*?)\s*\\\)', _collapse_inline, text, flags=re.S)
 
+    text = re.sub(r'\\\s+([\\()\\[\\]])', lambda m: '\\' + m.group(1), text)
+    text = re.sub(r'\\\s+([A-Za-z]+)', r'\\\1', text)
+    return text
 
 def append_text_with_math_to_story(story, text, style):
     if text is None:
@@ -151,6 +199,35 @@ def append_text_with_math_to_story(story, text, style):
             story.append(KeepTogether(flow_items))
             story.append(Spacer(1, 6))
 
+
+
+
+def add_paragraph_with_math(document, text, style_name=None):
+    if text is None:
+        return
+    text = strip_step_markers(text)
+    lines = str(text).splitlines() or ['']
+    for line in lines:
+        line = normalize_latex_spacing(line)
+        segments = split_text_with_math(line)
+        if not segments:
+            continue
+        paragraph = document.add_paragraph()
+        if style_name:
+            paragraph.style = style_name
+        for kind, value, display in segments:
+            if kind == 'text':
+                clean_text = value.strip()
+                if clean_text:
+                    paragraph.add_run(clean_text)
+            elif kind == 'math':
+                rendered = render_math_to_image(value, display=display)
+                if rendered:
+                    img_buffer, width_pt, height_pt = rendered
+                    if display:
+                        paragraph.alignment = 1
+                    run = paragraph.add_run()
+                    run.add_picture(img_buffer, width=Pt(width_pt * 0.9))
 def strip_step_markers(text):
     if not text:
         return text
@@ -610,6 +687,7 @@ def export_pdf():
     """生成された問題をPDF形式でエクスポート"""
     try:
         data = request.get_json() or {}
+        metadata = data.get('metadata') or {}
         problems = data.get('problems') or []
         problems_text = strip_step_markers(data.get('problems_text') or '')
         problems_text = normalize_latex_spacing(problems_text)
@@ -673,7 +751,8 @@ def export_pdf():
         )
 
         story = []
-        story.append(Paragraph('数学問題集', title_style))
+        title_text = metadata.get('unit') or '数学問題集'
+        story.append(Paragraph(title_text, title_style))
         story.append(Spacer(1, 12))
 
         problems_list = problems or parse_generated_problems(problems_text)
@@ -724,6 +803,7 @@ def export_word():
     """生成された問題をWord形式でエクスポート"""
     try:
         data = request.get_json() or {}
+        metadata = data.get('metadata') or {}
         problems = data.get('problems') or []
         problems_text = strip_step_markers(data.get('problems_text') or '')
         problems_text = normalize_latex_spacing(problems_text)
@@ -740,20 +820,18 @@ def export_word():
             return jsonify({'error': '出力する問題がありません'}), 400
 
         doc = Document()
-        doc.add_heading('数学問題集', 0)
+        title_text = metadata.get('unit') or '数学問題集'
+        doc.add_heading(title_text, 0)
 
         problems_list = problems or parse_generated_problems(problems_text)
         if not problems_list:
             for line in strip_step_markers(problems_text or '').split('\n'):
-                doc.add_paragraph(normalize_latex_spacing(line))
+                add_paragraph_with_math(doc, line)
         else:
             doc.add_heading('問題一覧', level=1)
             for idx, item in enumerate(problems_list, start=1):
                 doc.add_heading(f'問題{idx}', level=2)
-                problem_body = item.get('problem')
-                if problem_body:
-                    for segment in strip_step_markers(problem_body).splitlines() or ['']:
-                        doc.add_paragraph(normalize_latex_spacing(segment))
+                add_paragraph_with_math(doc, item.get('problem'))
                 doc.add_paragraph('')
 
             doc.add_page_break()
@@ -764,12 +842,10 @@ def export_word():
                 explanation = item.get('explanation')
                 if answer:
                     doc.add_heading('解答', level=3)
-                    for segment in strip_step_markers(answer).splitlines() or ['']:
-                        doc.add_paragraph(normalize_latex_spacing(segment))
+                    add_paragraph_with_math(doc, answer)
                 if explanation:
                     doc.add_heading('解説', level=3)
-                    for segment in strip_step_markers(explanation).splitlines() or ['']:
-                        doc.add_paragraph(normalize_latex_spacing(segment))
+                    add_paragraph_with_math(doc, explanation)
                 doc.add_paragraph('')
 
         buffer = io.BytesIO()
@@ -786,6 +862,10 @@ def export_word():
     except Exception as e:
         traceback.print_exc()
         return jsonify({'error': f'Word出力中にエラーが発生しました: {str(e)}'}), 500
+
+
+
+
 
 
 

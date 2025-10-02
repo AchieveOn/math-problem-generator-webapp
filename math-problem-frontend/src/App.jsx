@@ -262,9 +262,6 @@ function App() {
                     </MathText>
                   </div>
                 )}
-                {analysisResult.next_action_prompt && (
-                  <p className="text-sm text-gray-600 mt-4">{analysisResult.next_action_prompt}</p>
-                )}
               </CardContent>
             </Card>
           )}
