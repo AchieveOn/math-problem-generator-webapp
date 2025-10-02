@@ -9,7 +9,7 @@ from openai import OpenAI, APIConnectionError
 from PIL import Image as PILImage
 import requests
 from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, KeepTogether
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Image as RLImage, KeepTogether
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from xml.sax.saxutils import escape
 from reportlab.lib.units import inch
@@ -119,6 +119,48 @@ def normalize_latex_spacing(text):
     if not text:
         return text
     return re.sub(r'\\\s+', r'\\', text)
+
+
+
+
+
+
+def append_text_with_math_to_story(story, text, style):
+    if text is None:
+        return
+    text = strip_step_markers(text)
+    lines = str(text).splitlines() or ['']
+    for line in lines:
+        line = normalize_latex_spacing(line)
+        segments = split_text_with_math(line)
+        if not segments:
+            story.append(Spacer(1, 6))
+            continue
+        flow_items = []
+        for kind, value, display in segments:
+            if kind == 'text':
+                clean_text = value.strip()
+                if clean_text:
+                    flow_items.append(Paragraph(escape(clean_text), style))
+            elif kind == 'math':
+                rendered = render_math_to_image(value, display=display)
+                if rendered:
+                    img_buffer, width_pt, height_pt = rendered
+                    flow_items.append(RLImage(img_buffer, width=width_pt, height=height_pt))
+        if flow_items:
+            story.append(KeepTogether(flow_items))
+            story.append(Spacer(1, 6))
+
+def strip_step_markers(text):
+    if not text:
+        return text
+    filtered_lines = []
+    for line in str(text).splitlines():
+        stripped = line.strip()
+        if stripped.startswith('主要ステップ') or stripped.startswith('最終解'):
+            continue
+        filtered_lines.append(line)
+    return '\n'.join(filtered_lines).strip()
 
 
 def parse_structured_sections(raw_text):
@@ -274,6 +316,10 @@ def parse_generated_problems(raw_text):
         answer_body = normalize_latex_spacing(answer_body) if answer_body else None
         explanation_body = normalize_latex_spacing(explanation_body) if explanation_body else None
 
+        problem_body = strip_step_markers(problem_body) if problem_body else None
+        answer_body = strip_step_markers(answer_body) if answer_body else None
+        explanation_body = strip_step_markers(explanation_body) if explanation_body else None
+
         problems.append({
             'number': number,
             'title': title,
@@ -315,7 +361,7 @@ def normalize_problems_text(raw_text):
     result = result.replace('�B��v�X�e�b�v', '�B\n��v�X�e�b�v')
     result = result.replace('�B\n�ŏI�� ��', '\n�ŏI�� ��')
     lines = [line for line in result.splitlines() if line.strip() != '�B']
-    return '\n'.join(lines)
+    return strip_step_markers('\n'.join(lines))
 
 
 
@@ -558,22 +604,28 @@ def ocr_image():
 
 @math_bp.route('/download/pdf', methods=['POST'])
 @math_bp.route('/export-pdf', methods=['POST'])
+@math_bp.route('/download/pdf', methods=['POST'])
+@math_bp.route('/export-pdf', methods=['POST'])
 def export_pdf():
     """生成された問題をPDF形式でエクスポート"""
     try:
         data = request.get_json() or {}
         problems = data.get('problems') or []
-        problems_text = data.get('problems_text') or ''
+        problems_text = strip_step_markers(data.get('problems_text') or '')
         problems_text = normalize_latex_spacing(problems_text)
-        metadata = data.get('metadata') or {}
+
+        if not problems:
+            parsed = parse_generated_problems(problems_text)
+            if parsed:
+                problems = parsed
 
         if problems and not problems_text:
             problems_text = build_problems_text(problems)
 
-        problems_text = normalize_problems_text(problems_text)
+        problems_text = strip_step_markers(normalize_problems_text(problems_text))
         problems_text = normalize_latex_spacing(problems_text)
 
-        if not problems_text:
+        if not problems and not problems_text:
             return jsonify({'error': '出力する問題がありません'}), 400
 
         buffer = io.BytesIO()
@@ -588,6 +640,30 @@ def export_pdf():
             spaceAfter=24,
         )
 
+        section_title_style = ParagraphStyle(
+            'SectionTitle',
+            parent=styles['Heading2'],
+            fontName=DEFAULT_FONT_NAME,
+            fontSize=14,
+            spaceAfter=12,
+        )
+
+        problem_heading_style = ParagraphStyle(
+            'ProblemHeading',
+            parent=styles['Heading3'],
+            fontName=DEFAULT_FONT_NAME,
+            fontSize=13,
+            spaceAfter=6,
+        )
+
+        label_style = ParagraphStyle(
+            'LabelStyle',
+            parent=styles['Normal'],
+            fontName=DEFAULT_FONT_NAME,
+            fontSize=12,
+            spaceAfter=4,
+        )
+
         content_style = ParagraphStyle(
             'CustomContent',
             parent=styles['Normal'],
@@ -600,48 +676,32 @@ def export_pdf():
         story.append(Paragraph('数学問題集', title_style))
         story.append(Spacer(1, 12))
 
-        metadata_lines = []
-        grade = metadata.get('grade')
-        if grade:
-            metadata_lines.append(f'学年: {grade}')
-        unit = metadata.get('unit')
-        if unit:
-            metadata_lines.append(f'単元: {unit}')
-        difficulty_value = metadata.get('difficulty')
-        if difficulty_value:
-            metadata_lines.append(f'難易度: {difficulty_value}')
-        if metadata_lines:
-            story.append(Paragraph('<br/>'.join(escape(line) for line in metadata_lines), content_style))
-            story.append(Spacer(1, 12))
+        problems_list = problems or parse_generated_problems(problems_text)
+        if not problems_list:
+            for line in problems_text.split('\n'):
+                append_text_with_math_to_story(story, line, content_style)
+        else:
+            story.append(Paragraph('問題一覧', section_title_style))
+            story.append(Spacer(1, 6))
+            for idx, item in enumerate(problems_list, start=1):
+                story.append(Paragraph(f'問題{idx}', problem_heading_style))
+                append_text_with_math_to_story(story, item.get('problem'), content_style)
+                story.append(Spacer(1, 12))
 
-        notes = metadata.get('notes')
-        if notes:
-            for note_line in str(notes).splitlines():
-                if note_line.strip():
-                    story.append(Paragraph(escape(note_line.strip()), content_style))
-            story.append(Spacer(1, 12))
-
-        for line in problems_text.split('\n'):
-            line = normalize_latex_spacing(line)
-            segments = split_text_with_math(line)
-            if not segments:
-                story.append(Spacer(1, 6))
-                continue
-
-            flow_items = []
-            for kind, value, display in segments:
-                if kind == 'text':
-                    clean_text = value.strip()
-                    if clean_text:
-                        flow_items.append(Paragraph(escape(clean_text), content_style))
-                elif kind == 'math':
-                    rendered = render_math_to_image(value, display=display)
-                    if rendered:
-                        img_buffer, width_pt, height_pt = rendered
-                        flow_items.append(RLImage(img_buffer, width=width_pt, height=height_pt))
-            if flow_items:
-                story.append(KeepTogether(flow_items))
-                story.append(Spacer(1, 6))
+            story.append(PageBreak())
+            story.append(Paragraph('解答・解説', section_title_style))
+            story.append(Spacer(1, 6))
+            for idx, item in enumerate(problems_list, start=1):
+                story.append(Paragraph(f'問題{idx}', problem_heading_style))
+                answer = item.get('answer')
+                explanation = item.get('explanation')
+                if answer:
+                    story.append(Paragraph('解答', label_style))
+                    append_text_with_math_to_story(story, answer, content_style)
+                if explanation:
+                    story.append(Paragraph('解説', label_style))
+                    append_text_with_math_to_story(story, explanation, content_style)
+                story.append(Spacer(1, 12))
 
         doc.build(story)
         buffer.seek(0)
@@ -655,7 +715,7 @@ def export_pdf():
 
     except APIConnectionError:
         traceback.print_exc()
-        return jsonify({'error': f'PDF出力中にエラーが発生しました: {str(e)}'}), 500
+        return jsonify({'error': 'PDF出力中にエラーが発生しました: 接続エラー'}), 500
 
 
 @math_bp.route('/download/word', methods=['POST'])
@@ -665,14 +725,16 @@ def export_word():
     try:
         data = request.get_json() or {}
         problems = data.get('problems') or []
-        problems_text = data.get('problems_text') or ''
-        metadata = data.get('metadata') or {}
+        problems_text = strip_step_markers(data.get('problems_text') or '')
+        problems_text = normalize_latex_spacing(problems_text)
+
+        if not problems:
+            parsed = parse_generated_problems(problems_text)
+            if parsed:
+                problems = parsed
 
         if problems and not problems_text:
             problems_text = build_problems_text(problems)
-
-        if not problems and problems_text:
-            problems = parse_generated_problems(problems_text)
 
         if not problems and not problems_text:
             return jsonify({'error': '出力する問題がありません'}), 400
@@ -680,51 +742,35 @@ def export_word():
         doc = Document()
         doc.add_heading('数学問題集', 0)
 
-        metadata_lines = []
-        grade = metadata.get('grade')
-        if grade:
-            metadata_lines.append(f'学年: {grade}')
-        unit = metadata.get('unit')
-        if unit:
-            metadata_lines.append(f'単元: {unit}')
-        difficulty_value = metadata.get('difficulty')
-        if difficulty_value:
-            metadata_lines.append(f'難易度: {difficulty_value}')
-        for line in metadata_lines:
-            doc.add_paragraph(line)
-
-        notes = metadata.get('notes')
-        if notes:
-            for note_line in str(notes).splitlines():
-                doc.add_paragraph(note_line)
-
-        if problems:
-            for idx, item in enumerate(problems, start=1):
-                heading = f'問題{idx}'
-                title = item.get('title')
-                if title:
-                    heading += f'：{title}'
-                doc.add_heading(heading, level=1)
-
+        problems_list = problems or parse_generated_problems(problems_text)
+        if not problems_list:
+            for line in strip_step_markers(problems_text or '').split('\n'):
+                doc.add_paragraph(normalize_latex_spacing(line))
+        else:
+            doc.add_heading('問題一覧', level=1)
+            for idx, item in enumerate(problems_list, start=1):
+                doc.add_heading(f'問題{idx}', level=2)
                 problem_body = item.get('problem')
                 if problem_body:
-                    for segment in str(problem_body).splitlines() or ['']:
-                        doc.add_paragraph(segment)
+                    for segment in strip_step_markers(problem_body).splitlines() or ['']:
+                        doc.add_paragraph(normalize_latex_spacing(segment))
+                doc.add_paragraph('')
 
-                answer_body = item.get('answer')
-                if answer_body:
-                    doc.add_heading('【解答】', level=2)
-                    for segment in str(answer_body).splitlines() or ['']:
-                        doc.add_paragraph(segment)
-
-                explanation_body = item.get('explanation')
-                if explanation_body:
-                    doc.add_heading('【解説】', level=2)
-                    for segment in str(explanation_body).splitlines() or ['']:
-                        doc.add_paragraph(segment)
-        else:
-            for line in (problems_text or '').split('\n'):
-                doc.add_paragraph(normalize_latex_spacing(line))
+            doc.add_page_break()
+            doc.add_heading('解答・解説', level=1)
+            for idx, item in enumerate(problems_list, start=1):
+                doc.add_heading(f'問題{idx}', level=2)
+                answer = item.get('answer')
+                explanation = item.get('explanation')
+                if answer:
+                    doc.add_heading('解答', level=3)
+                    for segment in strip_step_markers(answer).splitlines() or ['']:
+                        doc.add_paragraph(normalize_latex_spacing(segment))
+                if explanation:
+                    doc.add_heading('解説', level=3)
+                    for segment in strip_step_markers(explanation).splitlines() or ['']:
+                        doc.add_paragraph(normalize_latex_spacing(segment))
+                doc.add_paragraph('')
 
         buffer = io.BytesIO()
         doc.save(buffer)
@@ -737,22 +783,9 @@ def export_word():
             mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
         )
 
-    except APIConnectionError:
+    except Exception as e:
         traceback.print_exc()
         return jsonify({'error': f'Word出力中にエラーが発生しました: {str(e)}'}), 500
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
